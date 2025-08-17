@@ -1,16 +1,29 @@
-use core::fmt;
+use core::{fmt, ptr::copy_nonoverlapping};
 
-use crate::{vwp, VGA_BUFFER_PTR};
+use crate::{VGA_BUFFER_PTR, vwp};
 
 /// The count of the available rows.
-const HEIGHT: usize = 25;
+pub const HEIGHT: usize = 25;
 
 /// The count of the individual byte pairs.
 /// This means that 80 different characters can be displayed on the screen in one row.
 /// Please note that a byte pair consists of 2 bytes ( char byte (u8) | attribute (u8) )
-const WIDTH: usize = 80;
+pub const WIDTH: usize = 80;
 
 pub type ScreenBuffer = [[ScreenCharacter; WIDTH]; HEIGHT];
+
+pub fn screen_buffer_to_vga_array(buffer: ScreenBuffer) -> [u8; (WIDTH * 2) * HEIGHT] {
+    let mut flat_array = [0; (WIDTH * 2) * HEIGHT];
+
+    for (row_idx, rows) in buffer.iter().enumerate() {
+        for (column_idx, column) in rows.iter().enumerate() {
+            flat_array[row_idx * WIDTH + column_idx] = column.character;
+            flat_array[row_idx * WIDTH + column_idx + 1] = column.color.as_byte();
+        }
+    }
+
+    flat_array
+}
 
 /// Tracks the bytes written to the VGA buffer, while tracking the position of the prints.
 /// This struct can also be made to access our written bytes.
@@ -18,8 +31,10 @@ pub type ScreenBuffer = [[ScreenCharacter; WIDTH]; HEIGHT];
 pub struct Viewport {
     pub buffer: ScreenBuffer,
 
+    pub write_to_vga_ptr: bool,
+
     current_width: usize,
-    current_height: usize,
+    current_line: usize,
 }
 
 impl Viewport {
@@ -34,7 +49,10 @@ impl Viewport {
                 }
                 // Write the char to the viewport based on the tracked position
                 _ => {
-                    self.write_char(ScreenCharacter { color: Color::default(), character: text_char as u8 });
+                    self.write_char(ScreenCharacter {
+                        color: Color::default(),
+                        character: text_char as u8,
+                    });
                 }
             }
         }
@@ -44,7 +62,13 @@ impl Viewport {
     /// This will not affect the local position counting.
     pub fn write_str_to_pos(&mut self, text: &str, (width, height): (usize, usize)) {
         for (idx, byte) in text.bytes().enumerate() {
-            self.write_char_to_pos(ScreenCharacter { color: Color::default(), character: byte }, (width + idx, height));
+            self.write_char_to_pos(
+                ScreenCharacter {
+                    color: Color::default(),
+                    character: byte,
+                },
+                (width + idx, height),
+            );
         }
     }
 
@@ -56,26 +80,31 @@ impl Viewport {
         }
 
         unsafe {
-            *VGA_BUFFER_PTR.offset((width * 2 + (height * WIDTH * 2)) as isize) = screen_char.character;
-            *VGA_BUFFER_PTR.offset((width * 2 + (height * WIDTH * 2)) as isize + 1) = screen_char.color.as_byte();
+            *VGA_BUFFER_PTR.offset((width * 2 + (height * WIDTH * 2)) as isize) =
+                screen_char.character;
+            *VGA_BUFFER_PTR.offset((width * 2 + (height * WIDTH * 2)) as isize + 1) =
+                screen_char.color.as_byte();
         }
 
         self.buffer[height][width] = screen_char;
     }
 
-
-    /// Writes a char to the viewport. 
+    /// Writes a char to the viewport.
     /// It also increments the position tracking.
     fn write_char(&mut self, screen_char: ScreenCharacter) {
         // Write the char to the VGA output
         unsafe {
-            // Apply text 
-            *VGA_BUFFER_PTR.offset((self.current_width + (self.current_height * WIDTH * 2)) as isize) = screen_char.character;
-            *VGA_BUFFER_PTR.offset((self.current_width + (self.current_height * WIDTH * 2)) as isize + 1) = screen_char.color.as_byte();
+            // Apply text
+            *VGA_BUFFER_PTR
+                .offset((self.current_width + (self.current_line * WIDTH * 2)) as isize) =
+                screen_char.character;
+            *VGA_BUFFER_PTR
+                .offset((self.current_width + (self.current_line * WIDTH * 2)) as isize + 1) =
+                screen_char.color.as_byte();
         }
 
         // Track the written byte in the Viewport state
-        self.buffer[self.current_height][self.current_width] = screen_char;
+        self.buffer[self.current_line][self.current_width] = screen_char;
 
         // Increment the indexes for a valid next write
         self.current_width += 2;
@@ -89,15 +118,22 @@ impl Viewport {
 
     fn new_line(&mut self) {
         self.current_width = 0;
-        self.current_height += 1;
+        self.current_line += 1;
+
+        if self.current_line >= HEIGHT {
+            self.current_line = 0;
+        }
     }
-    
+
     /// Creates a viewport with a pre-existing buffer.
     /// Automaticly draws the whole viewport.
     pub fn new_with_buffer(buffer: ScreenBuffer) -> Self {
         Self::redraw_buffer(buffer);
 
-        Self { buffer, ..Default::default() }
+        Self {
+            buffer,
+            ..Default::default()
+        }
     }
 
     /// Rewrites the whole buffer to the VGA BUFFER, this may be relatively costly.
@@ -105,10 +141,18 @@ impl Viewport {
         for (row_idx, row) in buffer.iter().enumerate() {
             for (column_idx, screen_char) in row.iter().enumerate() {
                 unsafe {
-                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize) = screen_char.character;
-                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize + 1) = screen_char.color.as_byte();
+                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize) =
+                        screen_char.character;
+                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize + 1) =
+                        screen_char.color.as_byte();
                 }
             }
+        }
+    }
+
+    pub fn draw_frame(&mut self, frame: [u8; (WIDTH * 2) * HEIGHT]) {
+        unsafe {
+            copy_nonoverlapping(frame.as_ptr(), VGA_BUFFER_PTR, (WIDTH * 2) * HEIGHT);
         }
     }
 
@@ -116,13 +160,23 @@ impl Viewport {
         for (row_idx, row) in self.buffer.iter().enumerate() {
             for (column_idx, _) in row.iter().enumerate() {
                 unsafe {
-                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize) = u8::MIN;
-                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize + 1) = u8::MIN;
+                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize) =
+                        u8::MIN;
+                    *VGA_BUFFER_PTR.offset((column_idx * 2 + (row_idx * WIDTH * 2)) as isize + 1) =
+                        u8::MIN;
                 }
             }
         }
 
         *self = Self::default();
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut ScreenBuffer {
+        &mut self.buffer
+    }
+
+    pub fn set_write_to_vga_ptr(&mut self, write_to_vga_ptr: bool) {
+        self.write_to_vga_ptr = write_to_vga_ptr;
     }
 }
 
@@ -133,7 +187,6 @@ impl fmt::Write for Viewport {
         Ok(())
     }
 }
-
 
 #[macro_export]
 macro_rules! println {
@@ -154,7 +207,12 @@ pub fn _print(args: fmt::Arguments) {
 
 impl Default for Viewport {
     fn default() -> Self {
-        Self { buffer: [[ScreenCharacter::default(); WIDTH]; HEIGHT], current_height: 0, current_width: 0 }
+        Self {
+            buffer: [[ScreenCharacter::default(); WIDTH]; HEIGHT],
+            current_line: 0,
+            current_width: 0,
+            write_to_vga_ptr: true,
+        }
     }
 }
 
@@ -166,7 +224,10 @@ pub struct ScreenCharacter {
 
 impl Default for ScreenCharacter {
     fn default() -> Self {
-        Self { color: Color::default(), character: 0 }    
+        Self {
+            color: Color::default(),
+            character: 0,
+        }
     }
 }
 
